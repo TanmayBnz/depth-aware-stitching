@@ -6,7 +6,9 @@ from typing import Tuple, Optional
 class DepthAwareHomography:
     """
     Estimates homography with depth-weighted RANSAC
-    IMPROVED: Better sampling strategy and diagnostics
+    IMPROVED: Automatically selects the best model between
+              standard RANSAC and depth-weighted RANSAC based
+              on a robust, un-weighted inlier count.
     """
     
     def __init__(self, ransac_iterations: int = 2000, inlier_threshold: float = 3.0):
@@ -24,26 +26,90 @@ class DepthAwareHomography:
     def estimate(self, pts1: np.ndarray, pts2: np.ndarray,
                  depth_weights: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Estimate homography
+        Estimate homography with an internal "safety net".
+        
+        If depth_weights are not provided, this runs standard RANSAC.
+        
+        If depth_weights ARE provided, this will:
+        1. Compute a standard RANSAC homography (H_std) and count its inliers.
+        2. Compute a depth-weighted RANSAC homography (H_dw) and count its inliers.
+        3. Return the homography that found the *most inliers*,
+           breaking ties in favor of the depth-weighted one.
+        
+        This provides an inherent "safety net" against "poisoned" depth
+        weights. The depth-aware method must prove it's better by
+        finding a larger consensus set (i.e., the true background plane).
         
         Args:
             pts1, pts2: Point correspondences (n_points, 2)
             depth_weights: Optional depth weights (n_points,)
         
         Returns:
-            H: Homography matrix (3, 3)
-            inliers: Boolean mask of inliers (n_points,)
+            H: The best homography matrix (3, 3)
+            inliers: Boolean mask of inliers for the best H (n_points,)
         """
         if len(pts1) < 4:
             raise ValueError("Need at least 4 point correspondences")
         
         if depth_weights is None:
-            # standard
+            # No weights provided, run standard RANSAC
+            self.debug_info['final_choice'] = 'standard (no weights)'
             return self._standard_ransac(pts1, pts2)
         else:
-            # depth-weighted
-            return self._depth_weighted_ransac(pts1, pts2, depth_weights)
-    
+            # --- START HYBRID "SAFETY NET" LOGIC ---
+            
+            # 1. Get the Standard RANSAC candidate
+            H_std, inliers_std_mask = self._standard_ransac(pts1, pts2)
+            if H_std is None: # Should only happen on total failure
+                H_std, _ = cv2.findHomography(pts1, pts2, 0) # Fallback to DLT
+            
+            # 2. Get the Depth-Weighted candidate
+            # We only care about the *hypothesis* (H_dw), not its inliers
+            H_dw, _ = self._depth_weighted_ransac(pts1, pts2, depth_weights)
+
+            if H_dw is None:
+                # Depth-weighted failed, must use standard
+                self.debug_info['final_choice'] = 'standard (dw_failed)'
+                return H_std, inliers_std_mask
+
+            # 3. Objectively score both candidates
+            # We re-calculate inliers for both H using a simple, un-weighted check.
+            # The model that finds the *largest consensus set* (most inliers) wins.
+            
+            errors_std = self._compute_reprojection_errors(pts1, pts2, H_std)
+            inliers_mask_std = errors_std < self.inlier_threshold
+            inlier_count_std = np.sum(inliers_mask_std)
+
+            errors_dw = self._compute_reprojection_errors(pts1, pts2, H_dw)
+            inliers_mask_dw = errors_dw < self.inlier_threshold
+            inlier_count_dw = np.sum(inliers_mask_dw)
+
+            # 4. Compare and return the winner
+            if inlier_count_dw >= inlier_count_std:
+                # Depth-weighted found a larger or equal consensus set.
+                # This means it found the true background plane.
+                self.debug_info['final_choice'] = 'depth_weighted'
+                
+                # Refine using weighted least squares on *its* inliers
+                refined_H = self._weighted_least_squares(pts1[inliers_mask_dw], pts2[inliers_mask_dw], depth_weights[inliers_mask_dw])
+                final_errors = self._compute_reprojection_errors(pts1, pts2, refined_H)
+                final_inliers = final_errors < self.inlier_threshold
+                
+                return refined_H, final_inliers
+            
+            else:
+                # Standard RANSAC found a larger consensus set.
+                # This means the depth weights were "poisoned". Fall back to standard.
+                self.debug_info['final_choice'] = 'standard (fallback)'
+
+                # Refine using weighted least squares on *its* inliers
+                refined_H = self._weighted_least_squares(pts1[inliers_mask_std], pts2[inliers_mask_std], depth_weights[inliers_mask_std])
+                final_errors = self._compute_reprojection_errors(pts1, pts2, refined_H)
+                final_inliers = final_errors < self.inlier_threshold
+
+                return refined_H, final_inliers
+            # --- END HYBRID "SAFETY NET" LOGIC ---
+
     def _standard_ransac(self, pts1: np.ndarray, pts2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Standard homography estimation with RANSAC
@@ -55,7 +121,10 @@ class DepthAwareHomography:
         )
         
         if H is None:
+            # RANSAC failed, fallback to DLT on all points
             H, _ = cv2.findHomography(pts1, pts2, 0)
+            if H is None:
+                return None, np.zeros(len(pts1), dtype=bool)
             mask = np.ones(len(pts1), dtype=np.uint8)
         
         inliers = mask.ravel().astype(bool)
@@ -66,6 +135,7 @@ class DepthAwareHomography:
                                depth_weights: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         IMPROVED Depth-weighted RANSAC with better sampling strategy
+        Returns: H, inliers
         """
         n_points = len(pts1)
         best_H = None
@@ -78,7 +148,7 @@ class DepthAwareHomography:
         sample_probs = sample_probs / (sample_probs.sum() + 1e-8)
         
         # Ensure minimum probability for all points
-        min_prob = 0.02  # Increased from 0.01
+        min_prob = 0.02
         sample_probs = np.maximum(sample_probs, min_prob)
         sample_probs = sample_probs / sample_probs.sum()
         
@@ -124,28 +194,17 @@ class DepthAwareHomography:
         
         # Store debug info
         self.debug_info = {
-            'bg_sample_ratio': bg_samples / (bg_samples + fg_samples),
-            'fg_sample_ratio': fg_samples / (bg_samples + fg_samples),
+            'bg_sample_ratio': bg_samples / (bg_samples + fg_samples + 1e-8),
+            'fg_sample_ratio': fg_samples / (bg_samples + fg_samples + 1e-8),
             'expected_bg_ratio': is_background.mean(),
-            'best_score': best_score
+            'best_dw_score': best_score
         }
         
         if best_H is None:
-            print("  [Warning] Depth-weighted RANSAC failed, falling back to standard")
-            return self._standard_ransac(pts1, pts2)
+            # Depth-weighted RANSAC found no model
+            return None, np.zeros(n_points, dtype=bool)
         
-        # Refine using weighted least squares on inliers
-        inlier_pts1 = pts1[best_inliers]
-        inlier_pts2 = pts2[best_inliers]
-        inlier_weights = depth_weights[best_inliers]
-        
-        refined_H = self._weighted_least_squares(inlier_pts1, inlier_pts2, inlier_weights)
-        
-        # Recompute inliers with refined H
-        errors = self._compute_reprojection_errors(pts1, pts2, refined_H)
-        final_inliers = errors < self.inlier_threshold
-        
-        return refined_H, final_inliers
+        return best_H, best_inliers
     
     def _compute_homography_dlt(self, pts1: np.ndarray, pts2: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -187,6 +246,13 @@ class DepthAwareHomography:
         This gives more importance to background points in refinement
         """
         n = len(pts1)
+        if n < 4:
+            # Not enough points, return DLT on all available
+            H_dlt = self._compute_homography_dlt(pts1, pts2)
+            if H_dlt is None: # Total failure, return identity
+                 return np.identity(3)
+            return H_dlt
+
         A = []
         
         for i in range(n):
@@ -239,6 +305,9 @@ class DepthAwareHomography:
         """
         IMPROVED: Compute comprehensive statistics about the homography and inliers
         """
+        if H is None:
+             return { 'n_inliers': 0, 'inlier_ratio': 0, 'mean_inlier_error': float('inf') }
+
         errors = self._compute_reprojection_errors(pts1, pts2, H)
         inlier_errors = errors[inliers]
         
