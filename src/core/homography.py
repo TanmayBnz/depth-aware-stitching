@@ -6,9 +6,10 @@ from typing import Tuple, Optional
 class DepthAwareHomography:
     """
     Estimates homography with depth-weighted RANSAC
+    IMPROVED: Better sampling strategy and diagnostics
     """
     
-    def __init__(self, ransac_iterations: int = 2000,inlier_threshold: float = 3.0):
+    def __init__(self, ransac_iterations: int = 2000, inlier_threshold: float = 3.0):
         """
         Initialize homography estimator
         
@@ -18,8 +19,10 @@ class DepthAwareHomography:
         """
         self.ransac_iterations = ransac_iterations
         self.inlier_threshold = inlier_threshold
+        self.debug_info = {}  # Store debug information
     
-    def estimate(self, pts1: np.ndarray, pts2: np.ndarray,depth_weights: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+    def estimate(self, pts1: np.ndarray, pts2: np.ndarray,
+                 depth_weights: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         Estimate homography
         
@@ -59,27 +62,40 @@ class DepthAwareHomography:
         
         return H, inliers
     
-    def _depth_weighted_ransac(self, pts1: np.ndarray, pts2: np.ndarray,depth_weights: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _depth_weighted_ransac(self, pts1: np.ndarray, pts2: np.ndarray,
+                               depth_weights: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Depth-weighted RANSAC
-        
-        innovation: Sample points with probability proportional to depth weight
+        IMPROVED Depth-weighted RANSAC with better sampling strategy
         """
         n_points = len(pts1)
         best_H = None
         best_score = -1
         best_inliers = None
         
-        sample_probs = depth_weights / (depth_weights.sum() + 1e-8)
+        # IMPROVED: Use less aggressive weighting for sampling
+        # Square root makes distribution less extreme
+        sample_probs = np.sqrt(depth_weights)
+        sample_probs = sample_probs / (sample_probs.sum() + 1e-8)
         
-        sample_probs = np.maximum(sample_probs, 0.01)
+        # Ensure minimum probability for all points
+        min_prob = 0.02  # Increased from 0.01
+        sample_probs = np.maximum(sample_probs, min_prob)
         sample_probs = sample_probs / sample_probs.sum()
+        
+        # Track statistics
+        bg_samples = 0
+        fg_samples = 0
+        is_background = depth_weights > 0.7
         
         for iteration in range(self.ransac_iterations):
             try:
                 sample_indices = np.random.choice(n_points, size=4, replace=False, p=sample_probs)
             except:
                 sample_indices = np.random.choice(n_points, size=4, replace=False)
+            
+            # Track sampling statistics
+            bg_samples += is_background[sample_indices].sum()
+            fg_samples += (~is_background[sample_indices]).sum()
             
             sample_pts1 = pts1[sample_indices]
             sample_pts2 = pts2[sample_indices]
@@ -89,29 +105,43 @@ class DepthAwareHomography:
             if H is None:
                 continue
             
-            # Compute reprojection
+            # Compute reprojection errors
             errors = self._compute_reprojection_errors(pts1, pts2, H)
-
             inliers = errors < self.inlier_threshold
             
-            # Compute WEIGHTED score
+            # IMPROVED: Use both weighted score AND inlier count
+            # This prevents selecting models with few but high-weight inliers
             weighted_score = (inliers * depth_weights).sum()
+            inlier_count = inliers.sum()
             
-            if weighted_score > best_score:
-                best_score = weighted_score
+            # Combined score: weight * sqrt(count) to balance quality and quantity
+            combined_score = weighted_score * np.sqrt(inlier_count)
+            
+            if combined_score > best_score:
+                best_score = combined_score
                 best_H = H
                 best_inliers = inliers
         
+        # Store debug info
+        self.debug_info = {
+            'bg_sample_ratio': bg_samples / (bg_samples + fg_samples),
+            'fg_sample_ratio': fg_samples / (bg_samples + fg_samples),
+            'expected_bg_ratio': is_background.mean(),
+            'best_score': best_score
+        }
+        
         if best_H is None:
+            print("  [Warning] Depth-weighted RANSAC failed, falling back to standard")
             return self._standard_ransac(pts1, pts2)
         
-        # refine using weighted least squares on inliers
+        # Refine using weighted least squares on inliers
         inlier_pts1 = pts1[best_inliers]
         inlier_pts2 = pts2[best_inliers]
         inlier_weights = depth_weights[best_inliers]
         
         refined_H = self._weighted_least_squares(inlier_pts1, inlier_pts2, inlier_weights)
         
+        # Recompute inliers with refined H
         errors = self._compute_reprojection_errors(pts1, pts2, refined_H)
         final_inliers = errors < self.inlier_threshold
         
@@ -184,7 +214,8 @@ class DepthAwareHomography:
             # Fallback to unweighted
             return self._compute_homography_dlt(pts1, pts2)
     
-    def _compute_reprojection_errors(self, pts1: np.ndarray, pts2: np.ndarray,H: np.ndarray) -> np.ndarray:
+    def _compute_reprojection_errors(self, pts1: np.ndarray, pts2: np.ndarray,
+                                    H: np.ndarray) -> np.ndarray:
         """
         Compute reprojection error for each point
         
@@ -195,16 +226,18 @@ class DepthAwareHomography:
         pts1_projected = (H @ pts1_h.T).T
         
         # Convert back to Cartesian
-        pts1_projected = pts1_projected[:, :2] / pts1_projected[:, 2:3]
+        pts1_projected = pts1_projected[:, :2] / (pts1_projected[:, 2:3] + 1e-8)
         
         # Compute Euclidean distance
         errors = np.linalg.norm(pts2 - pts1_projected, axis=1)
         
         return errors
     
-    def get_inlier_statistics(self, pts1: np.ndarray, pts2: np.ndarray,H: np.ndarray,inliers: np.ndarray) -> dict:
+    def get_inlier_statistics(self, pts1: np.ndarray, pts2: np.ndarray,
+                              H: np.ndarray, inliers: np.ndarray,
+                              depth_weights: Optional[np.ndarray] = None) -> dict:
         """
-        Compute statistics about the homography and inliers
+        IMPROVED: Compute comprehensive statistics about the homography and inliers
         """
         errors = self._compute_reprojection_errors(pts1, pts2, H)
         inlier_errors = errors[inliers]
@@ -217,4 +250,31 @@ class DepthAwareHomography:
             'median_inlier_error': np.median(inlier_errors) if len(inlier_errors) > 0 else 0
         }
         
+        # Add depth-aware statistics if weights provided
+        if depth_weights is not None:
+            # Background/foreground breakdown
+            is_background = depth_weights > 0.7
+            is_foreground = depth_weights < 0.4
+            
+            bg_inliers = inliers & is_background
+            fg_inliers = inliers & is_foreground
+            
+            stats['bg_inliers'] = bg_inliers.sum()
+            stats['fg_inliers'] = fg_inliers.sum()
+            stats['bg_inlier_ratio'] = bg_inliers.sum() / max(is_background.sum(), 1)
+            stats['fg_inlier_ratio'] = fg_inliers.sum() / max(is_foreground.sum(), 1)
+            
+            # Weighted inlier score
+            stats['weighted_inlier_score'] = (inliers * depth_weights).sum()
+            
+            # Average depth of inliers
+            if inliers.sum() > 0:
+                stats['mean_inlier_depth_weight'] = depth_weights[inliers].mean()
+            else:
+                stats['mean_inlier_depth_weight'] = 0
+        
         return stats
+    
+    def get_debug_info(self) -> dict:
+        """Get debug information from last weighted RANSAC run"""
+        return self.debug_info
